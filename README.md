@@ -43,6 +43,10 @@ Agent Usage Burst Planner is a local CLI and web tool for tracking real Codex / 
 
 It does not automatically call Codex, Claude Code, or any external service. It also does not automatically consume usage. The purpose is planning and reminders.
 
+### Guides
+
+- [Codex Prompt Commands](docs/codex-prompt-commands.md): CLI and Codex App command examples for sending or pre-filling prompts.
+
 ### Web UI
 
 Start the local web UI:
@@ -203,6 +207,10 @@ MIT
 Agent Usage Burst Planner 是一個本地 CLI 與網頁工具，用來追蹤 Codex / Claude Code 的實際使用時段、匯入本機 prompt log，並推算你最常工作的高峰時間。
 
 它不會自動呼叫 Codex、Claude Code 或任何外部服務，也不會自動消耗 usage。用途是提醒與規劃。
+
+### 文件
+
+- [Codex Prompt Commands](docs/codex-prompt-commands.md)：整理 CLI 與 Codex App 用指令送出或預填 prompt 的方式。
 
 ### 網頁介面
 
