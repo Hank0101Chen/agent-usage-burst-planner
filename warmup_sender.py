@@ -28,7 +28,7 @@ def send_warmup_cli(prompt: str, project_path: str | None = None) -> int:
     command = ["codex"]
     if project_path:
         command += ["--path", project_path]
-    command += ["exec", prompt]
+    command += ["exec", "--ephemeral", prompt]
 
     try:
         result = subprocess.run(
