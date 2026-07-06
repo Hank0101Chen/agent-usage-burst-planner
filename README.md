@@ -71,7 +71,7 @@ python usage_web.py --open
 
 The web UI and CLI use the same data file: `.usage_planner/usage.json`. The app runs locally and does not send your data to external services.
 
-Opening the web UI is enough for the dashboard features: importing logs, tuning preferred windows, editing preferences, adding historical sessions, viewing suggestions, and listing reminder times. It must remain running while you use the web page. It is not a background notification service after you close it.
+Opening the web UI is enough for the dashboard features: importing logs, tuning preferred windows, editing preferences, adding historical sessions, viewing suggestions, and listing reminder times. It must remain running while you use the web page. To stop the web server, simply press `Ctrl+C` in the terminal or close the terminal window. It is not a background notification service after you close it.
 
 ### CLI Quick Start
 
@@ -284,7 +284,7 @@ python usage_web.py --open
 
 網頁介面和 CLI 使用同一份資料檔 `.usage_planner/usage.json`。它只在本機執行，不會把資料傳到外部服務。
 
-只要開啟 Web UI，就可以使用儀表板上的主要功能：匯入 log、微調偏好時段、修改偏好、手動新增歷史 session、查看建議時段、列出提醒時間。使用網頁時，本機 server 需要持續開著。關掉後它不會變成背景通知服務。
+只要開啟 Web UI，就可以使用儀表板上的主要功能：匯入 log、微調偏好時段、修改偏好、手動新增歷史 session、查看建議時段、列出提醒時間。使用網頁時，本機 server 需要持續開著。要關閉網頁伺服器，只需在終端機按下 `Ctrl+C`，或直接關閉終端機視窗即可。關掉後它不會變成背景通知服務。
 
 ### CLI 快速開始
 
