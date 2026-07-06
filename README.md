@@ -11,6 +11,9 @@ Plan and track AI coding sessions to concentrate usage into your most valuable w
 
 ## Web UI Quick Start / 網頁介面快速開始
 
+> **Note / 注意**: To use the `warmup` (CLI mode) and `wrap` features, please make sure you have downloaded and installed the **Codex CLI**.
+> 若要使用 `warmup` (CLI 模式) 或 `wrap` 功能，請務必記得先下載安裝 **Codex CLI**。
+
 macOS:
 
 ```bash
