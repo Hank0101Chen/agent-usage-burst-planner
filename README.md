@@ -43,6 +43,8 @@ Agent Usage Burst Planner is a local CLI and web tool for tracking real Codex / 
 
 It does not automatically call Codex, Claude Code, or any external service. It also does not automatically consume usage. The purpose is planning and reminders.
 
+The `warmup` command is an exception: it deliberately sends a minimal prompt (e.g. `"ping"`) via Codex CLI before your predicted peak window so the session is already active when you start working. This consumes a very small amount of usage and is clearly marked as `auto-warmup` in the data.
+
 ### Guides
 
 - [Codex Prompt Commands](docs/codex-prompt-commands.md): CLI and Codex App command examples for sending or pre-filling prompts.
@@ -82,7 +84,7 @@ python3 usage_planner.py init
 Run setup non-interactively:
 
 ```bash
-python3 usage_planner.py init --non-interactive --preferred-window 19:00-23:00 --setup-lead-minutes 240
+python3 usage_planner.py init --non-interactive --preferred-window 19:00-23:00 --setup-lead-minutes 210
 ```
 
 Manually add a historical session:
@@ -138,6 +140,52 @@ Tune preferred windows from recent real sessions:
 python3 usage_planner.py tune --days 7
 ```
 
+### Warmup (Auto Pre-Peak Prompt)
+
+Send a minimal-usage prompt before the peak window to warm up the session. **This consumes a small amount of usage.**
+
+Preview without executing:
+
+```bash
+python3 usage_planner.py warmup --force --dry-run
+```
+
+Send warmup now (force ignores timing check):
+
+```bash
+python3 usage_planner.py warmup --force
+```
+
+Customize the prompt and lead time:
+
+```bash
+python3 usage_planner.py warmup --force --prompt "ping" --lead-minutes 30
+```
+
+Install a daily macOS launchd schedule:
+
+```bash
+python3 usage_planner.py schedule-warmup
+```
+
+Preview the schedule without installing:
+
+```bash
+python3 usage_planner.py schedule-warmup --dry-run
+```
+
+Remove the schedule:
+
+```bash
+python3 usage_planner.py schedule-warmup --uninstall
+```
+
+The standalone script `warmup_sender.py` can also be used directly:
+
+```bash
+python3 warmup_sender.py --force --dry-run
+```
+
 ### Data Location
 
 Default data path:
@@ -166,7 +214,7 @@ export USAGE_PLANNER_DATA=/path/to/usage.json
 - `import-logs` parses local Codex / Claude Code logs and stores only time, source, and counts. It does not save prompt text.
 - During log import, activities separated by more than 45 minutes are split into separate sessions. The final prompt gets a 15-minute tail buffer.
 - The default planning window is 300 minutes.
-- `setup-lead-minutes` defaults to 240 minutes, so reminders are listed 4 hours before the suggested peak window.
+- `setup-lead-minutes` defaults to 210 minutes, so reminders are listed 3.5 hours before the suggested peak window.
 - `tune` updates preferred windows from real sessions. By default, it needs at least 3 sessions and 180 total minutes.
 
 ### Example Workflow
@@ -208,6 +256,8 @@ Agent Usage Burst Planner 是一個本地 CLI 與網頁工具，用來追蹤 Cod
 
 它不會自動呼叫 Codex、Claude Code 或任何外部服務，也不會自動消耗 usage。用途是提醒與規劃。
 
+`warmup` 命令是唯一的例外：它會在預測的高峰時間前，透過 Codex CLI 主動送出一段極簡 prompt（例如 `"ping"`），讓 session 在你真正開始工作前就已經啟動。這會消耗極少量 usage，並在資料中明確標記為 `auto-warmup`。
+
 ### 文件
 
 - [Codex Prompt Commands](docs/codex-prompt-commands.md)：整理 CLI 與 Codex App 用指令送出或預填 prompt 的方式。
@@ -247,7 +297,7 @@ python3 usage_planner.py init
 也可以直接用非互動模式：
 
 ```bash
-python3 usage_planner.py init --non-interactive --preferred-window 19:00-23:00 --setup-lead-minutes 240
+python3 usage_planner.py init --non-interactive --preferred-window 19:00-23:00 --setup-lead-minutes 210
 ```
 
 手動補上一筆歷史紀錄：
@@ -303,6 +353,52 @@ python3 usage_planner.py reminders --analysis-days 7 --count 7
 python3 usage_planner.py tune --days 7
 ```
 
+### Warmup（高峰前自動暖機）
+
+在高峰時間前自動送出一段極低 usage 的 prompt，讓 session 提前啟動。**這會消耗少量 usage。**
+
+先預覽不執行：
+
+```bash
+python3 usage_planner.py warmup --force --dry-run
+```
+
+立即送出 warmup（--force 跳過時間檢查）：
+
+```bash
+python3 usage_planner.py warmup --force
+```
+
+自訂 prompt 和提前時間：
+
+```bash
+python3 usage_planner.py warmup --force --prompt "ping" --lead-minutes 30
+```
+
+安裝 macOS 每日 launchd 排程：
+
+```bash
+python3 usage_planner.py schedule-warmup
+```
+
+預覽排程內容：
+
+```bash
+python3 usage_planner.py schedule-warmup --dry-run
+```
+
+移除排程：
+
+```bash
+python3 usage_planner.py schedule-warmup --uninstall
+```
+
+也可以直接使用獨立腳本：
+
+```bash
+python3 warmup_sender.py --force --dry-run
+```
+
 ### 資料位置
 
 預設資料位置：
@@ -331,7 +427,7 @@ export USAGE_PLANNER_DATA=/path/to/usage.json
 - `import-logs` 會解析本機 Codex / Claude Code log，只保存時間、來源與計數，不保存 prompt 文字。
 - 匯入 log 時，預設兩次活動間隔超過 45 分鐘就切成新 session，最後一次 prompt 後補 15 分鐘當作結束緩衝。
 - 預設規劃視窗長度為 300 分鐘。
-- `setup-lead-minutes` 預設是 240 分鐘，也就是高峰前 4 小時提醒你檢查當天安排與可用用量。
+- `setup-lead-minutes` 預設是 210 分鐘，也就是高峰前 3.5 小時提醒你檢查當天安排與可用用量。
 - `tune` 只使用實際 session 來更新偏好，預設至少需要 3 筆紀錄且合計 180 分鐘。
 
 ### 範例工作流

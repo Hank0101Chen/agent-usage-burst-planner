@@ -14,6 +14,7 @@ import math
 import os
 import shlex
 import subprocess
+import urllib.parse
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -29,6 +30,9 @@ BUCKETS_PER_DAY = 24 * 60 // BUCKET_MINUTES
 DEFAULT_DATA_PATH = Path.cwd() / ".usage_planner" / "usage.json"
 DEFAULT_CODEX_LOG_ROOT = Path.home() / ".codex" / "sessions"
 DEFAULT_CLAUDE_LOG_ROOT = Path.home() / ".claude" / "projects"
+DEFAULT_WARMUP_PROMPT = "ping"
+LAUNCHD_LABEL = "com.usage-planner.warmup"
+LAUNCHD_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 
 
 @dataclass(frozen=True)
@@ -107,7 +111,7 @@ def blank_data(tz_name: str | None = None) -> dict[str, Any]:
                 {"start": "19:00", "end": "23:00"},
             ],
             "quota_window_minutes": 300,
-            "setup_lead_minutes": 240,
+            "setup_lead_minutes": 210,
         },
         "sessions": [],
     }
@@ -128,7 +132,7 @@ def load_data(path: Path) -> dict[str, Any]:
     data["preferences"].setdefault("tools", list(SUPPORTED_TOOLS))
     data["preferences"].setdefault("preferred_windows", [])
     data["preferences"].setdefault("quota_window_minutes", 300)
-    data["preferences"].setdefault("setup_lead_minutes", 240)
+    data["preferences"].setdefault("setup_lead_minutes", 210)
     data.setdefault("sessions", [])
     return data
 
@@ -406,7 +410,7 @@ def confidence_label(session_count: int, total_minutes: int) -> str:
 def make_suggestion(data: dict[str, Any], days: int) -> Suggestion:
     profile, session_count, total_minutes, source = build_profile(data, days)
     window_minutes = int(data["preferences"].get("quota_window_minutes", 300))
-    setup_lead = int(data["preferences"].get("setup_lead_minutes", 240))
+    setup_lead = int(data["preferences"].get("setup_lead_minutes", 210))
     start, end, _ = find_best_block(profile, window_minutes)
     remind = start - setup_lead
     return Suggestion(
@@ -757,7 +761,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     prefs["setup_lead_minutes"] = (
         args.setup_lead_minutes
         if args.setup_lead_minutes is not None
-        else int(prefs.get("setup_lead_minutes", 240))
+        else int(prefs.get("setup_lead_minutes", 210))
     )
 
     if not args.non_interactive and args.quota_window_minutes is None:
@@ -1005,6 +1009,289 @@ def cmd_tune(args: argparse.Namespace) -> int:
     return 0
 
 
+def send_warmup_cli(
+    prompt: str,
+    project_path: str | None = None,
+) -> int:
+    """Execute a warmup prompt via ``codex exec``."""
+    command = ["codex"]
+    if project_path:
+        command += ["--path", project_path]
+    command += ["exec", prompt]
+
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            timeout=120,
+            stdin=subprocess.DEVNULL,
+        )
+        return result.returncode
+    except FileNotFoundError:
+        print(
+            "錯誤：找不到 codex 命令。請安裝 Codex CLI 或改用 --method deeplink。",
+            file=sys.stderr,
+        )
+        return 127
+    except subprocess.TimeoutExpired:
+        print("警告：codex exec 超時（120 秒），已中斷。", file=sys.stderr)
+        return 124
+
+
+def send_warmup_deeplink(
+    prompt: str,
+    project_path: str | None = None,
+) -> int:
+    """Open Codex App with a pre-filled warmup prompt via deep link."""
+    encoded_prompt = urllib.parse.quote(prompt)
+    url = f"codex://threads/new?prompt={encoded_prompt}"
+    if project_path:
+        encoded_path = urllib.parse.quote(project_path)
+        url += f"&path={encoded_path}"
+
+    if sys.platform == "darwin":
+        command = ["open", url]
+    elif sys.platform == "win32":
+        command = ["powershell", "-Command", f'Start-Process "{url}"']
+    else:
+        print("錯誤：deep link 模式僅支援 macOS 和 Windows。", file=sys.stderr)
+        return 1
+
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            timeout=30,
+            stdin=subprocess.DEVNULL,
+        )
+        return result.returncode
+    except FileNotFoundError:
+        print(f"錯誤：找不到命令 {command[0]}。", file=sys.stderr)
+        return 127
+    except subprocess.TimeoutExpired:
+        print("警告：打開 deep link 超時。", file=sys.stderr)
+        return 124
+
+
+def should_warmup_now(
+    data: dict[str, Any],
+    warmup_lead_minutes: int,
+    tolerance_minutes: int = 10,
+    days: int = 7,
+) -> tuple[bool, str, datetime | None]:
+    """Check if now is the right time to send a warmup prompt.
+
+    Returns ``(should_fire, reason, peak_start)``.
+    """
+    suggestion = make_suggestion(data, days=days)
+    tz_name = data["timezone"]
+    current = now_in(tz_name)
+    tz = load_timezone(tz_name)
+
+    for offset in range(2):
+        day = current + timedelta(days=offset)
+        midnight = datetime(day.year, day.month, day.day, tzinfo=tz)
+        peak_start = midnight + timedelta(minutes=suggestion.start_minutes)
+        warmup_time = peak_start - timedelta(minutes=warmup_lead_minutes)
+
+        delta = abs((current - warmup_time).total_seconds()) / 60
+        if delta <= tolerance_minutes:
+            return (
+                True,
+                f"距離高峰 {format_clock(suggestion.start_minutes)} 還有 {warmup_lead_minutes} 分鐘",
+                peak_start,
+            )
+
+    return False, "目前不在 warmup 時間範圍內", None
+
+
+def cmd_warmup(args: argparse.Namespace) -> int:
+    """Send a minimal-usage warmup prompt before the peak window."""
+    path = data_path_from_arg(args.data)
+    data = load_data(path)
+    tz_name = data["timezone"]
+    lead_minutes = args.lead_minutes
+    if lead_minutes is None:
+        lead_minutes = int(data["preferences"].get("setup_lead_minutes", 210))
+
+    if not args.force:
+        should_fire, reason, _ = should_warmup_now(
+            data, lead_minutes, tolerance_minutes=args.tolerance_minutes, days=args.days
+        )
+        if not should_fire:
+            print(f"跳過 warmup：{reason}")
+            return 0
+        print(f"Warmup 時間到：{reason}")
+    else:
+        print(f"強制執行 warmup（--force），提前量 {lead_minutes} 分鐘")
+
+    if args.dry_run:
+        print(f"[dry-run] 會使用 {args.method} 模式送出 prompt：{args.prompt!r}")
+        if args.project_path:
+            print(f"[dry-run] 專案路徑：{args.project_path}")
+        print("[dry-run] 不會實際執行。")
+        return 0
+
+    started_at = now_in(tz_name)
+    print(f"正在送出 warmup prompt（{args.method}）：{args.prompt!r}")
+
+    if args.method == "cli":
+        exit_code = send_warmup_cli(args.prompt, args.project_path)
+    else:
+        exit_code = send_warmup_deeplink(args.prompt, args.project_path)
+
+    ended_at = now_in(tz_name)
+
+    append_session(
+        data,
+        "codex",
+        started_at,
+        ended_at,
+        source="auto-warmup",
+        extra={
+            "warmup_method": args.method,
+            "warmup_prompt": args.prompt,
+            "exit_code": exit_code,
+        },
+    )
+    save_data(path, data)
+
+    if exit_code == 0:
+        print("✓ Warmup 完成，已記錄到 usage.json。")
+    else:
+        print(f"⚠ Warmup 結束，exit code {exit_code}，已記錄到 usage.json。")
+    print("注意：warmup 會消耗少量 usage。")
+    return exit_code
+
+
+def generate_launchd_plist(
+    data: dict[str, Any],
+    method: str,
+    prompt: str,
+    lead_minutes: int | None = None,
+    project_path: str | None = None,
+    days: int = 7,
+) -> tuple[str, int, int]:
+    """Generate a macOS launchd plist for daily warmup.
+
+    Returns ``(plist_xml, hour, minute)``.
+    """
+    if lead_minutes is None:
+        lead_minutes = int(data["preferences"].get("setup_lead_minutes", 210))
+    suggestion = make_suggestion(data, days=days)
+    warmup_minutes = suggestion.start_minutes - lead_minutes
+    warmup_minutes %= 24 * 60
+    hour = warmup_minutes // 60
+    minute = warmup_minutes % 60
+
+    python = sys.executable
+    script = str(Path(__file__).resolve())
+
+    program_args = [
+        python, script, "warmup",
+        "--method", method,
+        "--prompt", prompt,
+        "--lead-minutes", str(lead_minutes),
+        "--days", str(days),
+        "--force",
+    ]
+    if project_path:
+        program_args += ["--project-path", project_path]
+
+    args_xml = "\n".join(f"        <string>{arg}</string>" for arg in program_args)
+
+    plist = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"\n'
+        '  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n'
+        "<dict>\n"
+        "    <key>Label</key>\n"
+        f"    <string>{LAUNCHD_LABEL}</string>\n"
+        "    <key>ProgramArguments</key>\n"
+        "    <array>\n"
+        f"{args_xml}\n"
+        "    </array>\n"
+        "    <key>StartCalendarInterval</key>\n"
+        "    <dict>\n"
+        "        <key>Hour</key>\n"
+        f"        <integer>{hour}</integer>\n"
+        "        <key>Minute</key>\n"
+        f"        <integer>{minute}</integer>\n"
+        "    </dict>\n"
+        "    <key>StandardOutPath</key>\n"
+        f"    <string>/tmp/{LAUNCHD_LABEL}.out.log</string>\n"
+        "    <key>StandardErrorPath</key>\n"
+        f"    <string>/tmp/{LAUNCHD_LABEL}.err.log</string>\n"
+        "</dict>\n"
+        "</plist>\n"
+    )
+    return plist, hour, minute
+
+
+def cmd_schedule_warmup(args: argparse.Namespace) -> int:
+    """Install or remove a macOS launchd schedule for daily warmup."""
+    if sys.platform != "darwin":
+        print("錯誤：schedule-warmup 目前只支援 macOS。", file=sys.stderr)
+        return 1
+
+    plist_path = LAUNCHD_PLIST_PATH
+
+    if args.uninstall:
+        if plist_path.exists():
+            subprocess.run(
+                ["launchctl", "unload", str(plist_path)],
+                check=False,
+            )
+            plist_path.unlink()
+            print(f"已移除排程：{plist_path}")
+        else:
+            print("排程檔不存在，無需移除。")
+        return 0
+
+    path = data_path_from_arg(args.data)
+    data = load_data(path)
+
+    plist_content, hour, minute = generate_launchd_plist(
+        data,
+        method=args.method,
+        prompt=args.prompt,
+        lead_minutes=args.lead_minutes,
+        project_path=args.project_path,
+        days=args.days,
+    )
+
+    if args.dry_run:
+        print(f"[dry-run] 會在 {plist_path} 建立排程")
+        print(f"[dry-run] 每日 {hour:02d}:{minute:02d} 執行 warmup")
+        print(f"[dry-run] plist 內容：")
+        print(plist_content)
+        return 0
+
+    # Unload existing schedule if present
+    if plist_path.exists():
+        subprocess.run(
+            ["launchctl", "unload", str(plist_path)],
+            check=False,
+        )
+
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    plist_path.write_text(plist_content, encoding="utf-8")
+
+    result = subprocess.run(
+        ["launchctl", "load", str(plist_path)],
+        check=False,
+    )
+    if result.returncode == 0:
+        print(f"✓ 已安裝 warmup 排程：每日 {hour:02d}:{minute:02d}")
+        print(f"  plist 位置：{plist_path}")
+        print(f"  log 位置：/tmp/{LAUNCHD_LABEL}.out.log")
+        print("注意：warmup 排程會在指定時間自動送出 prompt，會消耗少量 usage。")
+    else:
+        print(f"錯誤：launchctl load 失敗，exit code {result.returncode}", file=sys.stderr)
+    return result.returncode
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     path = data_path_from_arg(args.data)
     data = load_data(path)
@@ -1102,6 +1389,100 @@ def build_parser() -> argparse.ArgumentParser:
     tune_parser.add_argument("--min-minutes", type=int, default=180)
     tune_parser.add_argument("--force", action="store_true")
     tune_parser.set_defaults(func=cmd_tune)
+
+    warmup_parser = subparsers.add_parser(
+        "warmup",
+        help="在高峰前送出極低 usage 的 warmup prompt（會消耗少量 usage）",
+    )
+    warmup_parser.add_argument(
+        "--method",
+        choices=["cli", "deeplink"],
+        default="cli",
+        help="送出方式：cli 使用 codex exec，deeplink 使用 codex:// App（預設 cli）",
+    )
+    warmup_parser.add_argument(
+        "--prompt",
+        default=DEFAULT_WARMUP_PROMPT,
+        help=f"Warmup prompt 內容（預設 {DEFAULT_WARMUP_PROMPT!r}）",
+    )
+    warmup_parser.add_argument(
+        "--project-path",
+        default=None,
+        help="指定專案路徑",
+    )
+    warmup_parser.add_argument(
+        "--lead-minutes",
+        type=int,
+        default=None,
+        help="高峰前幾分鐘執行 warmup（預設使用 setup-lead-minutes 偏好值）",
+    )
+    warmup_parser.add_argument(
+        "--tolerance-minutes",
+        type=int,
+        default=10,
+        help="判斷是否在 warmup 時間範圍內的容忍分鐘數（預設 10）",
+    )
+    warmup_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只顯示會做什麼，不實際執行",
+    )
+    warmup_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="不檢查時間，強制執行 warmup",
+    )
+    warmup_parser.add_argument(
+        "--days",
+        type=int,
+        default=7,
+        help="計算高峰時間的歷史天數（預設 7）",
+    )
+    warmup_parser.set_defaults(func=cmd_warmup)
+
+    schedule_parser = subparsers.add_parser(
+        "schedule-warmup",
+        help="安裝或移除 macOS launchd 每日 warmup 排程（會消耗少量 usage）",
+    )
+    schedule_parser.add_argument(
+        "--method",
+        choices=["cli", "deeplink"],
+        default="cli",
+        help="送出方式（預設 cli）",
+    )
+    schedule_parser.add_argument(
+        "--prompt",
+        default=DEFAULT_WARMUP_PROMPT,
+        help=f"Warmup prompt 內容（預設 {DEFAULT_WARMUP_PROMPT!r}）",
+    )
+    schedule_parser.add_argument(
+        "--project-path",
+        default=None,
+        help="指定專案路徑",
+    )
+    schedule_parser.add_argument(
+        "--lead-minutes",
+        type=int,
+        default=None,
+        help="高峰前幾分鐘執行 warmup（預設使用 setup-lead-minutes 偏好值）",
+    )
+    schedule_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只顯示 plist 內容，不安裝",
+    )
+    schedule_parser.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="移除已安裝的排程",
+    )
+    schedule_parser.add_argument(
+        "--days",
+        type=int,
+        default=7,
+        help="計算高峰時間的歷史天數（預設 7）",
+    )
+    schedule_parser.set_defaults(func=cmd_schedule_warmup)
 
     return parser
 

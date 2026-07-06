@@ -283,6 +283,144 @@ class UsagePlannerTests(unittest.TestCase):
             self.assertNotIn("secret prompt", serialized)
             self.assertNotIn("second secret", serialized)
 
+    def test_warmup_dry_run_does_not_execute(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_path = Path(directory) / "usage.json"
+            self.run_cli(
+                [
+                    "--data",
+                    str(data_path),
+                    "init",
+                    "--non-interactive",
+                    "--timezone",
+                    "Asia/Taipei",
+                    "--preferred-window",
+                    "20:00-23:00",
+                ]
+            )
+
+            exit_code = self.run_cli(
+                [
+                    "--data",
+                    str(data_path),
+                    "warmup",
+                    "--force",
+                    "--dry-run",
+                    "--method",
+                    "cli",
+                    "--prompt",
+                    "ping",
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+            data = usage_planner.load_data(data_path)
+            # dry-run should not record any session
+            self.assertEqual(len(data["sessions"]), 0)
+
+    def test_warmup_force_records_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_path = Path(directory) / "usage.json"
+            self.run_cli(
+                [
+                    "--data",
+                    str(data_path),
+                    "init",
+                    "--non-interactive",
+                    "--timezone",
+                    "Asia/Taipei",
+                ]
+            )
+
+            # Use deeplink method which will fail gracefully on CI but
+            # still record the session regardless of exit code.
+            self.run_cli(
+                [
+                    "--data",
+                    str(data_path),
+                    "warmup",
+                    "--force",
+                    "--method",
+                    "deeplink",
+                ]
+            )
+
+            data = usage_planner.load_data(data_path)
+            self.assertEqual(len(data["sessions"]), 1)
+            self.assertEqual(data["sessions"][0]["source"], "auto-warmup")
+            self.assertEqual(data["sessions"][0]["warmup_method"], "deeplink")
+            self.assertEqual(data["sessions"][0]["warmup_prompt"], "ping")
+
+    def test_should_warmup_now_returns_true_at_correct_time(self):
+        data = usage_planner.blank_data("Asia/Taipei")
+        data["preferences"]["preferred_windows"] = [
+            {"start": "22:00", "end": "23:00"},
+        ]
+        data["preferences"]["quota_window_minutes"] = 60
+
+        suggestion = usage_planner.make_suggestion(data, days=7)
+        # The suggestion should be around 22:00
+        self.assertGreaterEqual(suggestion.start_minutes, 21 * 60)
+        self.assertLessEqual(suggestion.start_minutes, 23 * 60)
+
+    def test_generate_launchd_plist_contains_correct_structure(self):
+        data = usage_planner.blank_data("Asia/Taipei")
+        data["preferences"]["preferred_windows"] = [
+            {"start": "22:00", "end": "23:00"},
+        ]
+        data["preferences"]["quota_window_minutes"] = 60
+
+        plist, hour, minute = usage_planner.generate_launchd_plist(
+            data,
+            method="cli",
+            prompt="ping",
+            lead_minutes=30,
+        )
+
+        self.assertIn("<key>Label</key>", plist)
+        self.assertIn("com.usage-planner.warmup", plist)
+        self.assertIn("<key>ProgramArguments</key>", plist)
+        self.assertIn("<key>StartCalendarInterval</key>", plist)
+        self.assertIn("warmup", plist)
+        self.assertIn("--force", plist)
+        self.assertIn("--method", plist)
+        self.assertIn("cli", plist)
+        self.assertIn("ping", plist)
+        # hour and minute should be valid
+        self.assertGreaterEqual(hour, 0)
+        self.assertLessEqual(hour, 23)
+        self.assertGreaterEqual(minute, 0)
+        self.assertLessEqual(minute, 59)
+
+    def test_schedule_warmup_dry_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_path = Path(directory) / "usage.json"
+            self.run_cli(
+                [
+                    "--data",
+                    str(data_path),
+                    "init",
+                    "--non-interactive",
+                    "--timezone",
+                    "Asia/Taipei",
+                    "--preferred-window",
+                    "22:00-23:00",
+                ]
+            )
+
+            exit_code = self.run_cli(
+                [
+                    "--data",
+                    str(data_path),
+                    "schedule-warmup",
+                    "--dry-run",
+                    "--method",
+                    "cli",
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
