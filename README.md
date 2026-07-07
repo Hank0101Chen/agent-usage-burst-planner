@@ -167,6 +167,8 @@ python3 usage_planner.py warmup --force --prompt "ping" --lead-minutes 30
 
 Install a daily macOS launchd schedule:
 
+> **Important (macOS Privacy Restrictions)**: macOS blocks background `launchd` tasks from reading protected folders like `Documents`, `Desktop`, and `Downloads`. If you want to use the schedule feature, **you must place this project folder outside of those protected locations** (e.g. `~/agent-usage-burst-planner` or `~/Projects/agent-usage-burst-planner`). Otherwise, the schedule will fail with an `Operation not permitted` error.
+
 ```bash
 python3 usage_planner.py schedule-warmup
 ```
@@ -379,6 +381,8 @@ python3 usage_planner.py warmup --force --prompt "ping" --lead-minutes 30
 ```
 
 安裝 macOS 每日 launchd 排程：
+
+> **重要注意事項（macOS 權限限制）**：macOS 會阻擋背景 `launchd` 排程讀取受保護的資料夾（如 `文件 Documents`、`桌面 Desktop` 與 `下載項目 Downloads`）。如果你想使用排程功能，**請務必將此專案資料夾放在受保護目錄之外**（例如 `~/agent-usage-burst-planner` 或是 `~/Projects/agent-usage-burst-planner`），否則排程在背景執行時會發生 `Operation not permitted` 的錯誤而失效。
 
 ```bash
 python3 usage_planner.py schedule-warmup
