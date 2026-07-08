@@ -165,8 +165,10 @@ def run_warmup(
 
     if exit_code == 0:
         print("✓ Warmup 完成，已記錄到 usage.json。")
+        usage_planner.send_macos_notification("Usage Planner", "✓ Warmup 完成，已記錄到 usage.json。")
     else:
         print(f"⚠ Warmup 結束，exit code {exit_code}，已記錄到 usage.json。")
+        usage_planner.send_macos_notification("Usage Planner", f"⚠ Warmup 結束，exit code {exit_code}。")
 
     return exit_code
 

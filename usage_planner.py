@@ -33,6 +33,8 @@ DEFAULT_CLAUDE_LOG_ROOT = Path.home() / ".claude" / "projects"
 DEFAULT_WARMUP_PROMPT = "ping"
 LAUNCHD_LABEL = "com.usage-planner.warmup"
 LAUNCHD_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+SCHTASKS_TASK_NAME = "UsagePlannerWarmup"
+SCHTASKS_LOG_DIR = Path.home() / ".usage_planner" / "logs"
 
 
 @dataclass(frozen=True)
@@ -1009,6 +1011,50 @@ def cmd_tune(args: argparse.Namespace) -> int:
     return 0
 
 
+def send_notification(title: str, message: str) -> None:
+    """Send a desktop notification. Works on macOS and Windows."""
+    try:
+        if sys.platform == "darwin":
+            script = (
+                f'display notification "{message}" '
+                f'with title "{title}"'
+            )
+            subprocess.run(
+                ["osascript", "-e", script],
+                check=False,
+                timeout=10,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        elif sys.platform == "win32":
+            # Use PowerShell BalloonTip notification (works without extra modules)
+            ps_script = (
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                "$n = New-Object System.Windows.Forms.NotifyIcon; "
+                "$n.Icon = [System.Drawing.SystemIcons]::Information; "
+                "$n.Visible = $true; "
+                f"$n.ShowBalloonTip(5000, '{title}', '{message}', "
+                "[System.Windows.Forms.ToolTipIcon]::Info); "
+                "Start-Sleep -Seconds 3; "
+                "$n.Dispose()"
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_script],
+                check=False,
+                timeout=15,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except Exception:
+        pass
+
+
+# Backward compatibility alias
+send_macos_notification = send_notification
+
+
 def send_warmup_cli(
     prompt: str,
     project_path: str | None = None,
@@ -1158,8 +1204,10 @@ def cmd_warmup(args: argparse.Namespace) -> int:
 
     if exit_code == 0:
         print("✓ Warmup 完成，已記錄到 usage.json。")
+        send_notification("Usage Planner", "✓ Warmup 完成，已記錄到 usage.json。")
     else:
         print(f"⚠ Warmup 結束，exit code {exit_code}，已記錄到 usage.json。")
+        send_notification("Usage Planner", f"⚠ Warmup 結束，exit code {exit_code}。")
     print("注意：warmup 會消耗少量 usage。")
     return exit_code
 
@@ -1236,59 +1284,54 @@ def generate_launchd_plist(
     return plist, hour, minute
 
 
-def cmd_schedule_warmup(args: argparse.Namespace) -> int:
-    """Install or remove a macOS launchd schedule for daily warmup."""
-    if sys.platform != "darwin":
-        print("錯誤：schedule-warmup 目前只支援 macOS。", file=sys.stderr)
-        return 1
+def _compute_warmup_time(
+    data: dict[str, Any],
+    lead_minutes: int | None,
+    days: int,
+) -> tuple[int, int]:
+    """Return ``(hour, minute)`` for the daily warmup schedule."""
+    if lead_minutes is None:
+        lead_minutes = int(data["preferences"].get("setup_lead_minutes", 210))
+    suggestion = make_suggestion(data, days=days)
+    warmup_minutes = suggestion.start_minutes - lead_minutes
+    warmup_minutes %= 24 * 60
+    return warmup_minutes // 60, warmup_minutes % 60
 
+
+def install_schedule_darwin(
+    data: dict[str, Any],
+    method: str,
+    prompt: str,
+    lead_minutes: int | None,
+    project_path: str | None,
+    days: int,
+    dry_run: bool,
+) -> int:
+    """Install or display a macOS launchd warmup schedule."""
     plist_path = LAUNCHD_PLIST_PATH
-
-    if args.uninstall:
-        if plist_path.exists():
-            subprocess.run(
-                ["launchctl", "unload", str(plist_path)],
-                check=False,
-            )
-            plist_path.unlink()
-            print(f"已移除排程：{plist_path}")
-        else:
-            print("排程檔不存在，無需移除。")
-        return 0
-
-    path = data_path_from_arg(args.data)
-    data = load_data(path)
-
     plist_content, hour, minute = generate_launchd_plist(
         data,
-        method=args.method,
-        prompt=args.prompt,
-        lead_minutes=args.lead_minutes,
-        project_path=args.project_path,
-        days=args.days,
+        method=method,
+        prompt=prompt,
+        lead_minutes=lead_minutes,
+        project_path=project_path,
+        days=days,
     )
 
-    if args.dry_run:
+    if dry_run:
         print(f"[dry-run] 會在 {plist_path} 建立排程")
         print(f"[dry-run] 每日 {hour:02d}:{minute:02d} 執行 warmup")
         print(f"[dry-run] plist 內容：")
         print(plist_content)
         return 0
 
-    # Unload existing schedule if present
     if plist_path.exists():
-        subprocess.run(
-            ["launchctl", "unload", str(plist_path)],
-            check=False,
-        )
+        subprocess.run(["launchctl", "unload", str(plist_path)], check=False)
 
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_text(plist_content, encoding="utf-8")
 
-    result = subprocess.run(
-        ["launchctl", "load", str(plist_path)],
-        check=False,
-    )
+    result = subprocess.run(["launchctl", "load", str(plist_path)], check=False)
     if result.returncode == 0:
         print(f"✓ 已安裝 warmup 排程：每日 {hour:02d}:{minute:02d}")
         print(f"  plist 位置：{plist_path}")
@@ -1297,6 +1340,137 @@ def cmd_schedule_warmup(args: argparse.Namespace) -> int:
     else:
         print(f"錯誤：launchctl load 失敗，exit code {result.returncode}", file=sys.stderr)
     return result.returncode
+
+
+def uninstall_schedule_darwin() -> tuple[bool, str]:
+    """Remove a macOS launchd warmup schedule. Returns ``(removed, message)``."""
+    plist_path = LAUNCHD_PLIST_PATH
+    if plist_path.exists():
+        subprocess.run(["launchctl", "unload", str(plist_path)], check=False)
+        plist_path.unlink()
+        return True, f"已移除排程：{plist_path}"
+    return False, "排程檔不存在，無需移除。"
+
+
+def install_schedule_windows(
+    data: dict[str, Any],
+    method: str,
+    prompt: str,
+    lead_minutes: int | None,
+    project_path: str | None,
+    days: int,
+    dry_run: bool,
+) -> int:
+    """Install a Windows Task Scheduler warmup schedule."""
+    hour, minute = _compute_warmup_time(data, lead_minutes, days)
+
+    python = sys.executable
+    script = str(Path(__file__).resolve())
+    log_dir = SCHTASKS_LOG_DIR
+    log_dir.mkdir(parents=True, exist_ok=True)
+    out_log = log_dir / "warmup.out.log"
+    err_log = log_dir / "warmup.err.log"
+
+    warmup_args = [
+        python, script, "warmup",
+        "--method", method,
+        "--prompt", prompt,
+        "--lead-minutes", str(lead_minutes or int(data["preferences"].get("setup_lead_minutes", 210))),
+        "--days", str(days),
+        "--force",
+    ]
+    if project_path:
+        warmup_args += ["--project-path", project_path]
+
+    # Build a cmd /c command that redirects stdout/stderr to log files
+    inner_cmd = subprocess.list2cmdline(warmup_args)
+    task_cmd = f'cmd /c "{inner_cmd} > "{out_log}" 2> "{err_log}""'
+
+    if dry_run:
+        print(f"[dry-run] 會建立 Windows 排程任務：{SCHTASKS_TASK_NAME}")
+        print(f"[dry-run] 每日 {hour:02d}:{minute:02d} 執行 warmup")
+        print(f"[dry-run] 命令：{task_cmd}")
+        return 0
+
+    # Remove existing task first (ignore errors if it doesn't exist)
+    subprocess.run(
+        ["schtasks", "/Delete", "/TN", SCHTASKS_TASK_NAME, "/F"],
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    result = subprocess.run(
+        [
+            "schtasks", "/Create",
+            "/TN", SCHTASKS_TASK_NAME,
+            "/TR", task_cmd,
+            "/SC", "DAILY",
+            "/ST", f"{hour:02d}:{minute:02d}",
+            "/F",
+        ],
+        check=False,
+        stdin=subprocess.DEVNULL,
+    )
+    if result.returncode == 0:
+        print(f"✓ 已安裝 warmup 排程：每日 {hour:02d}:{minute:02d}")
+        print(f"  任務名稱：{SCHTASKS_TASK_NAME}")
+        print(f"  log 位置：{out_log}")
+        print("注意：warmup 排程會在指定時間自動送出 prompt，會消耗少量 usage。")
+    else:
+        print(f"錯誤：schtasks /Create 失敗，exit code {result.returncode}", file=sys.stderr)
+    return result.returncode
+
+
+def uninstall_schedule_windows() -> tuple[bool, str]:
+    """Remove a Windows Task Scheduler warmup schedule. Returns ``(removed, message)``."""
+    result = subprocess.run(
+        ["schtasks", "/Query", "/TN", SCHTASKS_TASK_NAME],
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        return False, "排程任務不存在，無需移除。"
+    result = subprocess.run(
+        ["schtasks", "/Delete", "/TN", SCHTASKS_TASK_NAME, "/F"],
+        check=False,
+        stdin=subprocess.DEVNULL,
+    )
+    if result.returncode == 0:
+        return True, f"已移除排程任務：{SCHTASKS_TASK_NAME}"
+    return False, f"移除排程任務失敗，exit code {result.returncode}"
+
+
+def cmd_schedule_warmup(args: argparse.Namespace) -> int:
+    """Install or remove a daily warmup schedule (macOS launchd / Windows Task Scheduler)."""
+    if sys.platform not in ("darwin", "win32"):
+        print("錯誤：schedule-warmup 目前只支援 macOS 和 Windows。", file=sys.stderr)
+        return 1
+
+    if args.uninstall:
+        if sys.platform == "darwin":
+            removed, msg = uninstall_schedule_darwin()
+        else:
+            removed, msg = uninstall_schedule_windows()
+        print(msg)
+        return 0
+
+    path = data_path_from_arg(args.data)
+    data = load_data(path)
+
+    if sys.platform == "darwin":
+        return install_schedule_darwin(
+            data, args.method, args.prompt, args.lead_minutes,
+            args.project_path, args.days, args.dry_run,
+        )
+    else:
+        return install_schedule_windows(
+            data, args.method, args.prompt, args.lead_minutes,
+            args.project_path, args.days, args.dry_run,
+        )
 
 
 def cmd_report(args: argparse.Namespace) -> int:
@@ -1449,7 +1623,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     schedule_parser = subparsers.add_parser(
         "schedule-warmup",
-        help="安裝或移除 macOS launchd 每日 warmup 排程（會消耗少量 usage）",
+        help="安裝或移除每日 warmup 排程（macOS launchd / Windows Task Scheduler，會消耗少量 usage）",
     )
     schedule_parser.add_argument(
         "--method",

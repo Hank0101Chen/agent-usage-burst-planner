@@ -953,13 +953,15 @@ class WebApp:
             raise ValueError("資料量不足，請累積更多資料或使用 force。")
         data["preferences"]["preferred_windows"] = [planner.window_to_dict(window) for window in windows]
         self.save(data)
+        windows_text = ",".join(
+            f"{item['start']}-{item['end']}"
+            for item in data["preferences"]["preferred_windows"]
+        )
+        print(f"[WebUI] ✓ 自動微調偏好時段：{windows_text}（sessions={session_count}, 總計 {total_minutes} 分鐘）")
         return {
             "session_count": session_count,
             "total_minutes": total_minutes,
-            "windows_text": ",".join(
-                f"{item['start']}-{item['end']}"
-                for item in data["preferences"]["preferred_windows"]
-            ),
+            "windows_text": windows_text,
         }
 
     def save_preferences(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -987,6 +989,16 @@ class WebApp:
             maximum=1440,
         )
         self.save(data)
+        windows_text = ",".join(
+            f"{item['start']}-{item['end']}"
+            for item in prefs.get("preferred_windows", [])
+        ) or "（未設定）"
+        print(
+            f"[WebUI] ✓ 偏好設定已儲存 — "
+            f"時段：{windows_text} / "
+            f"視窗長度：{prefs['quota_window_minutes']} 分鐘 / "
+            f"提前提醒：{prefs['setup_lead_minutes']} 分鐘"
+        )
         return {"saved": True}
 
     def add_session(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1000,6 +1012,8 @@ class WebApp:
             raise ValueError("結束時間必須晚於開始時間。")
         planner.append_session(data, tool, start, end, source="manual-web")
         self.save(data)
+        duration = int((end - start).total_seconds() // 60)
+        print(f"[WebUI] ✓ 已新增 {tool} 使用紀錄：{planner.format_duration(duration)}（{start.strftime('%H:%M')}–{end.strftime('%H:%M')}）")
         return {"saved": True}
 
     def warmup(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1021,9 +1035,11 @@ class WebApp:
                 data, lead_minutes, days=days
             )
             if not should_fire:
+                print(f"[WebUI] 跳過 warmup：{reason}")
                 return {"exit_code": 0, "message": f"跳過 warmup：{reason}", "skipped": True}
 
         if dry_run:
+            print(f"[WebUI] [dry-run] 會使用 {method} 模式送出 prompt：{prompt!r}，提前量 {lead_minutes} 分鐘")
             return {
                 "exit_code": 0,
                 "message": f"[dry-run] 會使用 {method} 模式送出 prompt：{prompt!r}，提前量 {lead_minutes} 分鐘",
@@ -1031,6 +1047,7 @@ class WebApp:
             }
 
         started_at = planner.now_in(tz_name)
+        print(f"[WebUI] 正在送出 warmup prompt（{method}）：{prompt!r}")
 
         if method == "cli":
             exit_code = planner.send_warmup_cli(prompt, project_path)
@@ -1057,53 +1074,78 @@ class WebApp:
             msg = "✓ Warmup 完成，已記錄到 usage.json。"
         else:
             msg = f"⚠ Warmup 結束，exit code {exit_code}，已記錄。"
+        print(f"[WebUI] {msg}")
+        planner.send_macos_notification("Usage Planner", msg)
         return {"exit_code": exit_code, "message": msg}
 
     def schedule_warmup(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if sys.platform != "darwin":
-            raise ValueError("schedule-warmup 目前只支援 macOS。")
+        if sys.platform not in ("darwin", "win32"):
+            raise ValueError("schedule-warmup 目前只支援 macOS 和 Windows。")
         data = self.load()
         method = payload.get("method", "cli")
         prompt = str(payload.get("prompt") or "ping")
         project_path = payload.get("project_path") or None
         days = int(payload.get("days", 7))
+        lead_minutes = payload.get("lead_minutes")
+        if lead_minutes is not None:
+            lead_minutes = int(lead_minutes)
 
-        plist_content, hour, minute = planner.generate_launchd_plist(
-            data,
-            method=method,
-            prompt=prompt,
-            project_path=project_path,
-            days=days,
-        )
-
-        plist_path = planner.LAUNCHD_PLIST_PATH
-        if plist_path.exists():
-            subprocess.run(
-                ["launchctl", "unload", str(plist_path)],
-                check=False,
+        if sys.platform == "darwin":
+            plist_content, hour, minute = planner.generate_launchd_plist(
+                data,
+                method=method,
+                prompt=prompt,
+                lead_minutes=lead_minutes,
+                project_path=project_path,
+                days=days,
             )
 
-        plist_path.parent.mkdir(parents=True, exist_ok=True)
-        plist_path.write_text(plist_content, encoding="utf-8")
+            plist_path = planner.LAUNCHD_PLIST_PATH
+            if plist_path.exists():
+                subprocess.run(
+                    ["launchctl", "unload", str(plist_path)],
+                    check=False,
+                )
 
-        result = subprocess.run(
-            ["launchctl", "load", str(plist_path)],
-            check=False,
-        )
-        if result.returncode == 0:
-            return {"message": f"✓ 已安裝 warmup 排程：每日 {hour:02d}:{minute:02d}"}
-        raise ValueError(f"launchctl load 失敗，exit code {result.returncode}")
+            plist_path.parent.mkdir(parents=True, exist_ok=True)
+            plist_path.write_text(plist_content, encoding="utf-8")
+
+            result = subprocess.run(
+                ["launchctl", "load", str(plist_path)],
+                check=False,
+            )
+            if result.returncode == 0:
+                msg = f"✓ 已安裝 warmup 排程：每日 {hour:02d}:{minute:02d}"
+                print(f"[WebUI] {msg}")
+                print(f"[WebUI]   plist 位置：{plist_path}")
+                print(f"[WebUI]   log 位置：/tmp/{planner.LAUNCHD_LABEL}.out.log")
+                return {"message": msg}
+            raise ValueError(f"launchctl load 失敗，exit code {result.returncode}")
+        else:
+            # Windows
+            rc = planner.install_schedule_windows(
+                data, method, prompt, lead_minutes, project_path, days, dry_run=False,
+            )
+            if rc == 0:
+                hour, minute = planner._compute_warmup_time(data, lead_minutes, days)
+                msg = f"✓ 已安裝 warmup 排程：每日 {hour:02d}:{minute:02d}"
+                print(f"[WebUI] {msg}")
+                print(f"[WebUI]   任務名稱：{planner.SCHTASKS_TASK_NAME}")
+                return {"message": msg}
+            raise ValueError(f"schtasks /Create 失敗，exit code {rc}")
 
     def uninstall_warmup(self) -> dict[str, Any]:
-        plist_path = planner.LAUNCHD_PLIST_PATH
-        if plist_path.exists():
-            subprocess.run(
-                ["launchctl", "unload", str(plist_path)],
-                check=False,
-            )
-            plist_path.unlink()
-            return {"message": f"已移除排程：{plist_path}"}
-        return {"message": "排程檔不存在，無需移除。"}
+        if sys.platform == "darwin":
+            removed, msg = planner.uninstall_schedule_darwin()
+        elif sys.platform == "win32":
+            removed, msg = planner.uninstall_schedule_windows()
+        else:
+            return {"message": "目前平台不支援排程。"}
+        if removed:
+            print(f"[WebUI] {msg}")
+        else:
+            print(f"[WebUI] {msg}")
+        return {"message": msg}
 
 
 def positive_int(value: Any, default: int, name: str) -> int:
@@ -1209,7 +1251,10 @@ def make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
             self.wfile.write(encoded)
 
         def log_message(self, format: str, *args: Any) -> None:
-            return
+            # Only suppress GET request logs to reduce noise; show POST/DELETE actions
+            if self.command == "GET":
+                return
+            sys.stderr.write(f"[WebUI] {self.command} {self.path} — {format % args}\n")
 
     return Handler
 
